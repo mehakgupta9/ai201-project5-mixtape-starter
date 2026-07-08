@@ -161,3 +161,29 @@ rate_song, guarded by `if song.shared_by != user_id` (same "don't notify yoursel
 add_to_playlist uses), with type "song_rated". Verified a rating by another user now
 creates exactly one song_rated notification, and that a user rating their own song creates
 none. Ran pytest tests/ to confirm the existing playlist-add notification still works.
+
+
+### Issue #1 — Listening streak resets on Sundays
+
+**How you reproduced it:** Called update_listening_streak directly with a user whose
+last_listened_at was a Saturday and now set to the following Sunday (consecutive days,
+starting streak 12). Expected 13, got 1. A control case with the same one-day gap on a
+non-Sunday (Mon->Tue) correctly returned 13 — isolating the weekday as the only variable.
+
+**How you found the root cause:** Traced from routes/songs.py listen() ->
+streak_service.record_listening_event() -> update_listening_streak(). Read the branch that
+decides increment vs reset. The elif condition was `days_since_last == 1 and
+today.weekday() != 6`. I confirmed with the AI that datetime.weekday() returns 6 for
+Sunday, then verified by reading the code: on Sundays the elif is False, so control falls
+into the else branch that resets the streak. The control-vs-Sunday experiment confirmed it.
+
+**The root cause:** Python's datetime.weekday() returns 6 for Sunday. The increment branch
+required `today.weekday() != 6`, so any consecutive-day listen that landed on a Sunday
+failed the condition and fell through to the else branch, which resets listening_streak to
+1. There is no legitimate reason for consecutive-day streak logic to exclude a weekday;
+the clause was spurious.
+
+**Your fix and side-effect check:** Removed the `and today.weekday() != 6` clause so the
+branch is just `elif days_since_last == 1:`. Verified all four boundary cases: consecutive
+Sat->Sun now increments (12->13), same-day repeat unchanged, 2+ day gap still resets to 1,
+first-ever listen starts at 1. Ran pytest tests/test_streaks.py.

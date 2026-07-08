@@ -3,6 +3,44 @@
 **Author:** Mehak Gupta
 **Branch:** `bugfix/mixtape`
 
+
+---
+
+## AI Usage
+
+I used Claude Code (Anthropic's CLI) throughout this project, primarily as a
+navigation and explanation aid rather than a code generator. Being honest about
+where it helped and where it was wrong:
+
+**Codebase orientation.** I asked it to summarize each service file's
+responsibility and to trace two call chains (playlist-add → notification, and
+listen → streak update). This sped up building my codebase map, but I verified
+every claim by reading the route → service → model code myself before writing it
+down.
+
+**Where AI pointed me in the WRONG direction (Issue #3).** My original plan was
+to fix Issue #3 (search duplicates), and the AI's first prediction was that the
+`.outerjoin(song_tags)` would return one duplicate row per tag. When I actually
+reproduced it, the endpoint returned `count: 1`, not 3 — the bug did *not* occur.
+Digging in, we found the reason: the code uses the legacy `db.session.query(Song)
+.all()` API, which auto-deduplicates entities by primary key, so the fan-out is
+masked (only the newer `session.execute(select(...))` path would show duplicates).
+This is a concrete case where the AI's plausible-sounding diagnosis was wrong
+until I verified it by running the code — so I switched Issue #3 for Issue #1.
+
+**Debugging support (Issues #1, #4, #5).** I used AI to confirm the semantics of
+`datetime.weekday()` (Sunday = 6) once I had already narrowed Issue #1 to that
+comparison, and to compare the `rate_song` vs `add_to_playlist` blocks side by
+side for Issue #4. In both cases the AI explained code I had already located; I
+confirmed each diagnosis by reading the function and running controlled inputs
+(a Flask shell / standalone script) myself before changing anything.
+
+**What I did without AI.** Choosing which three bugs to fix, reproducing each bug,
+writing the actual fixes, deciding the boundary/side-effect checks, and running
+the test suite were my own work. The AI was a faster way to read and reason about
+unfamiliar code, not a substitute for verifying the behavior.
+
+
 ---
 
 ## Milestone 1 — Codebase Map
@@ -118,72 +156,125 @@ Stretch (if time): **Issue #2 — feed recency** (`RECENT_THRESHOLD` is a rollin
 
 ## Milestone 2 — Root Cause Analyses
 
+I fixed the bugs in the order #5 → #4 → #1 (simplest root cause to most subtle),
+and wrote each entry immediately after fixing that bug. Each entry below has all
+five required fields.
+
+---
+
 ### Issue #5 — The last song in a playlist never shows up
 
-**How you reproduced it:** GET /playlists/<Friday Energy id>/songs returned count 6
-for a playlist seeded with 7 songs. The missing song was always the highest-position
-(most recently added) one — "Harlem Renaissance".
+**Issue number and title:** Issue #5 — "The last song in a playlist never shows up"
+(reported by darius). Affected service: `playlist_service.py`.
 
-**How you found the root cause:** Started at routes/playlists.py get_songs() → it calls
-playlist_service.get_playlist_songs(). Read that function top-down: the query correctly
-joins playlist_entries, filters by playlist_id, and orders by position ascending, fetching
-all 7 rows. The moment I read the return line I saw `songs[:-1]` — that was the exact cause.
+**How I reproduced it:** On a freshly seeded DB, "Friday Energy" is created with 7
+songs (`seed_data.py` inserts `all_songs[3:10]` into `playlist_entries` with positions
+1–7). I fetched the playlist and counted:
+```
+GET /playlists/<Friday Energy id>/songs   →   {"count": 6, ...}
+```
+Six songs came back for a 7-song playlist, and the missing one was always the
+highest-`position` entry ("Harlem Renaissance"). This matched darius's report that the
+*most recently added* song is the one that disappears, and that adding another song
+"frees" the previous one (because the newly added song then takes the last position).
 
-**The root cause:** The query returns all songs correctly, but the return statement sliced
-the list with `songs[:-1]`, which in Python means "every element except the last." So the
-last-positioned song was always discarded before the response was built.
+**How I found the root cause:** I followed the call chain top-down rather than jumping to
+a guess. Started at the route `get_songs()` in `routes/playlists.py`, which delegates
+straight to `playlist_service.get_playlist_songs()`. Reading that function line by line:
+the query correctly `.join`s `playlist_entries`, filters by `playlist_id`, and
+`.order_by(asc(position))`, fetching all 7 rows. The query was not the problem. The moment
+of certainty was the very last line — `return [song.to_dict() for song in songs[:-1]]`.
+The `[:-1]` slice is the specific cause, not just a suspicious area.
 
-**Your fix and side-effect check:** Changed `songs[:-1]` to `songs`. Verified the endpoint
-now returns count 7 with "Harlem Renaissance" present. Checked the empty-playlist case
-(returns [], unchanged) and the 1-song case (now returns 1, previously 0), and ran
-pytest tests/test_playlists.py.
+**The root cause:** The query returns all 7 songs correctly, but the return statement
+slices the list with `songs[:-1]`, which in Python means "every element except the last."
+Because the list is ordered by `position` ascending, the last element is always the
+highest-positioned (most recently added) song, so that one song is silently discarded
+before the response is built. The count is therefore always exactly one less than the
+real number of songs.
+
+**My fix and side-effect check:** Changed `songs[:-1]` to `songs` so every fetched song is
+returned. Verified the same endpoint now returns `"count": 7` with "Harlem Renaissance"
+present. Boundary checks on both sides of the slice: an empty playlist still returns `[]`
+(previously `[][:-1]` was also `[]`, so no regression), and a 1-song playlist now returns
+1 (previously it returned 0 — the same bug at the smallest size). Ran `pytest tests/` —
+all 13 tests pass, including `tests/test_playlists.py`.
+
+---
 
 ### Issue #4 — Notified on playlist-add but not on rating
 
-**How you reproduced it:** Checked the song sharer's notifications (count 0), had a
-different user POST /songs/<id>/rate with score 5 (rating saved, returned 201), then
-re-checked the sharer's notifications — still count 0. No song_rated notification is
-ever created.
+**Issue number and title:** Issue #4 — "I got notified when a friend added my song to a
+playlist but not when they rated it" (reported by aaliya). Affected service:
+`notification_service.py`.
 
-**How you found the root cause:** Started at routes/songs.py rate() → it calls
-notification_service.rate_song(). Since notifications live in the same file, I compared
-rate_song to its sibling add_to_playlist (the working path). add_to_playlist ends with a
-guarded create_notification() call; rate_song saves the Rating, commits, and returns —
-with no create_notification() anywhere. That structural absence was the confirmation.
+**How I reproduced it:** I compared the two friend-interaction actions on the same shared
+song (Crown Heights Anthem, shared by simone). First I read simone's notifications
+(`GET /users/<simone>/notifications` → `count: 0`). Then a *different* user (kenji) rated
+the song: `POST /songs/<song>/rate` with `{"user_id": <kenji>, "score": 5}` → returned
+`201` with the saved rating (score 5). Re-reading simone's notifications → still `count: 0`.
+The rating persisted but no notification was ever created — while the playlist-add action
+on the same song *does* create one. That contrast confirmed the bug is specific to rating.
 
-**The root cause:** rate_song correctly persists the Rating but never calls
-create_notification(). The notify-the-sharer step that exists in add_to_playlist was
-simply never written into rate_song — so ratings are saved but no notification is ever
-generated. It is a missing behavior, not a faulty comparison or typo (architectural).
+**How I found the root cause:** Followed `routes/songs.py rate()` → `notification_service.
+rate_song()`. Because both friend-interaction actions live in the same file, I put
+`rate_song` and its working sibling `add_to_playlist` side by side. `add_to_playlist` ends
+with a guarded `create_notification(...)` call to the song's sharer; `rate_song` validates
+the score, upserts the `Rating`, commits, and returns — with no `create_notification` call
+anywhere in the function. The confidence came from that line-by-line structural comparison:
+the notify step isn't broken, it's absent.
 
-**Your fix and side-effect check:** Added a create_notification() call at the end of
-rate_song, guarded by `if song.shared_by != user_id` (same "don't notify yourself" check
-add_to_playlist uses), with type "song_rated". Verified a rating by another user now
-creates exactly one song_rated notification, and that a user rating their own song creates
-none. Ran pytest tests/ to confirm the existing playlist-add notification still works.
+**The root cause:** `rate_song` correctly persists the `Rating`, but it never calls
+`create_notification()`. The "notify the original sharer" step that exists in
+`add_to_playlist` was simply never written into `rate_song`, so a rating is saved with no
+side effect for the sharer. This is a *missing step*, not a faulty comparison or typo —
+architectural, exactly as the brief's hint suggested.
 
+**My fix and side-effect check:** Added a `create_notification()` call at the end of
+`rate_song` (after the commit), of type `"song_rated"`, guarded by the same
+`if song.shared_by != user_id` check `add_to_playlist` uses so a user rating their own song
+isn't notified. No new imports were needed — `song`, `rater`, `user_id`, `score`, and
+`create_notification` are all already in scope. Verified via a controlled run: a rating by
+another user takes the sharer's notifications from 0 → 1 with type `song_rated` and body
+`"nova rated your song 'Crown Heights Anthem' 5 stars."`; a user rating their *own* song
+adds nothing (guard works). Ran `pytest tests/` — all pass, confirming the existing
+playlist-add notification path still works.
+
+---
 
 ### Issue #1 — Listening streak resets on Sundays
 
-**How you reproduced it:** Called update_listening_streak directly with a user whose
-last_listened_at was a Saturday and now set to the following Sunday (consecutive days,
-starting streak 12). Expected 13, got 1. A control case with the same one-day gap on a
-non-Sunday (Mon->Tue) correctly returned 13 — isolating the weekday as the only variable.
+**Issue number and title:** Issue #1 — "My listening streak keeps resetting" (reported by
+kenji). Affected service: `streak_service.py`.
 
-**How you found the root cause:** Traced from routes/songs.py listen() ->
-streak_service.record_listening_event() -> update_listening_streak(). Read the branch that
-decides increment vs reset. The elif condition was `days_since_last == 1 and
-today.weekday() != 6`. I confirmed with the AI that datetime.weekday() returns 6 for
-Sunday, then verified by reading the code: on Sundays the elif is False, so control falls
-into the else branch that resets the streak. The control-vs-Sunday experiment confirmed it.
+**How I reproduced it:** The buggy function `update_listening_streak(user, now)` takes the
+current time as a parameter, so I could reproduce it deterministically without touching the
+system clock. I called it with a user whose `last_listened_at` was a Saturday and `now` set
+to the following Sunday (consecutive calendar days, starting streak 12): the streak came
+back as **1** instead of the expected **13**. A control case with the identical one-day gap
+on non-Sunday days (Mon → Tue) correctly returned **13**. Same gap, only the weekday
+differed — which isolated "is today Sunday?" as the trigger and matched kenji's report that
+"both times it was a Sunday."
 
-**The root cause:** Python's datetime.weekday() returns 6 for Sunday. The increment branch
-required `today.weekday() != 6`, so any consecutive-day listen that landed on a Sunday
-failed the condition and fell through to the else branch, which resets listening_streak to
-1. There is no legitimate reason for consecutive-day streak logic to exclude a weekday;
-the clause was spurious.
+**How I found the root cause:** Traced the real flow `routes/songs.py listen()` →
+`streak_service.record_listening_event()` → `update_listening_streak()`, then read the
+branch that chooses between incrementing and resetting. The `elif` read
+`days_since_last == 1 and today.weekday() != 6`. I used AI to confirm the semantics of
+`datetime.weekday()` (Monday = 0 … Sunday = 6), then verified by reading the branch myself:
+when today is Sunday, `today.weekday() != 6` is False, so the whole `elif` is False and
+control falls into the `else`, which resets the streak. The control-vs-Sunday experiment
+above proved that was the exact cause, not just a suspicious line.
 
-**Your fix and side-effect check:** Removed the `and today.weekday() != 6` clause so the
-branch is just `elif days_since_last == 1:`. Verified all four boundary cases: consecutive
-Sat->Sun now increments (12->13), same-day repeat unchanged, 2+ day gap still resets to 1,
-first-ever listen starts at 1. Ran pytest tests/test_streaks.py.
+**The root cause:** Python's `datetime.weekday()` returns 6 for Sunday. The increment
+branch required `today.weekday() != 6`, so any consecutive-day listen that landed on a
+Sunday failed that condition and fell through to the `else` branch, which sets
+`listening_streak = 1`. There is no legitimate reason for consecutive-day streak logic to
+care about the day of the week; the `and today.weekday() != 6` clause was spurious and
+turned every Sunday into a forced reset.
+
+**My fix and side-effect check:** Removed the `and today.weekday() != 6` clause so the
+branch is simply `elif days_since_last == 1:`. Because this is a boundary condition, I
+verified all four cases around the branch: consecutive Sat → Sun now increments (12 → 13),
+a same-day repeat listen is unchanged (no double-count), a 2+ day gap still resets to 1,
+and a first-ever listen (`last_listened_at is None`) still starts at 1. Ran
+`pytest tests/` — all 13 pass, including `tests/test_streaks.py`.

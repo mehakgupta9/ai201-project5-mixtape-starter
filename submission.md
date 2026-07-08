@@ -138,3 +138,26 @@ now returns count 7 with "Harlem Renaissance" present. Checked the empty-playlis
 (returns [], unchanged) and the 1-song case (now returns 1, previously 0), and ran
 pytest tests/test_playlists.py.
 
+### Issue #4 — Notified on playlist-add but not on rating
+
+**How you reproduced it:** Checked the song sharer's notifications (count 0), had a
+different user POST /songs/<id>/rate with score 5 (rating saved, returned 201), then
+re-checked the sharer's notifications — still count 0. No song_rated notification is
+ever created.
+
+**How you found the root cause:** Started at routes/songs.py rate() → it calls
+notification_service.rate_song(). Since notifications live in the same file, I compared
+rate_song to its sibling add_to_playlist (the working path). add_to_playlist ends with a
+guarded create_notification() call; rate_song saves the Rating, commits, and returns —
+with no create_notification() anywhere. That structural absence was the confirmation.
+
+**The root cause:** rate_song correctly persists the Rating but never calls
+create_notification(). The notify-the-sharer step that exists in add_to_playlist was
+simply never written into rate_song — so ratings are saved but no notification is ever
+generated. It is a missing behavior, not a faulty comparison or typo (architectural).
+
+**Your fix and side-effect check:** Added a create_notification() call at the end of
+rate_song, guarded by `if song.shared_by != user_id` (same "don't notify yourself" check
+add_to_playlist uses), with type "song_rated". Verified a rating by another user now
+creates exactly one song_rated notification, and that a user rating their own song creates
+none. Ran pytest tests/ to confirm the existing playlist-add notification still works.
